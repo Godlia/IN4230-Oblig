@@ -1,0 +1,1 @@
+https://www.uio.no/studier/emner/matnat/ifi/IN3230/h26/obligatorisk-oppgave/obligatorisk-oppgave.html
