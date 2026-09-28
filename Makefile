@@ -1,24 +1,30 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c11 -g
 CPPFLAGS = -Isrc
+BUILD_DIR = build
+TARGET_DIR = target
 
-TARGETS = mipd ping_client ping_server
+TARGETS = $(TARGET_DIR)/mipd $(TARGET_DIR)/ping_client $(TARGET_DIR)/ping_server
 
 all: $(TARGETS)
 
-mipd: src/mipd.o src/mip_common.o
-	$(CC) $(CFLAGS) -o $@ src/mipd.o src/mip_common.o
+$(TARGET_DIR)/mipd: $(BUILD_DIR)/mipd.o $(BUILD_DIR)/mip_common.o
+	mkdir -p $(TARGET_DIR)
+	$(CC) $(CFLAGS) -o $@ $(BUILD_DIR)/mipd.o $(BUILD_DIR)/mip_common.o
 
-ping_client: src/ping_client.o src/mip_common.o
-	$(CC) $(CFLAGS) -o $@ src/ping_client.o src/mip_common.o
+$(TARGET_DIR)/ping_client: $(BUILD_DIR)/ping_client.o $(BUILD_DIR)/mip_common.o
+	mkdir -p $(TARGET_DIR)
+	$(CC) $(CFLAGS) -o $@ $(BUILD_DIR)/ping_client.o $(BUILD_DIR)/mip_common.o
 
-ping_server: src/ping_server.o src/mip_common.o
-	$(CC) $(CFLAGS) -o $@ src/ping_server.o src/mip_common.o
+$(TARGET_DIR)/ping_server: $(BUILD_DIR)/ping_server.o $(BUILD_DIR)/mip_common.o
+	mkdir -p $(TARGET_DIR)
+	$(CC) $(CFLAGS) -o $@ $(BUILD_DIR)/ping_server.o $(BUILD_DIR)/mip_common.o
 
-src/%.o: src/%.c src/*.h
+$(BUILD_DIR)/%.o: src/%.c src/*.h
+	mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGETS) src/*.o
+	rm -rf $(BUILD_DIR) $(TARGET_DIR)
 
 .PHONY: all clean
