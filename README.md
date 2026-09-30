@@ -12,9 +12,15 @@ This means that there could be an argument for smaller networks to implement MIP
 
 IPv4 also doesnt use ARP in the same way as MIP in this case. MIP integrates the ARP mechanism into itself, while IPv4 uses the literal ARProtocol, and is not necessarily connected to every IP transmission. This raises a few questions about the "ethics" of MIP, as we want to keep the network dumb and only process what is needed. In this case, the router / node always checks the message to see if it is an ARP request - which also implies it can read information that it is not privvy to.
 
+Personally, I think the IP's method of address resolution is a decent solution, as it makes the protocols handle only what they are designed for. Saving processing power and avoiding unnecessary reading of packets. The AR should also be decentralized, as I really dislike the idea of centralized address resolution - nobody likes DNS...
+
+If i could easily change something, it would be to remove the ARP part from the daemon, and make it its own protocol with its own headers. This way we could also mitigate the downsides of rebroadcasting by cutting out unecessary broadcasts. Essentially making it more directly pointed and routed, instead of a large spread hoping to hit its target.
+
+***Which really just sounds like IP again...***
+
 ### Flowchart
 
-```
+```text
                      +---------------------------+
                      |         START             |
                      +---------------------------+
@@ -91,7 +97,7 @@ IPv4 also doesnt use ARP in the same way as MIP in this case. MIP integrates the
                           +---------------------------+
 ```
 
-**NB: Stylized and formatted by Gemini**
+* **NB: Stylized and formatted by Gemini**
 
 ### AI Disclaimer
 
