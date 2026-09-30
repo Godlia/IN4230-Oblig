@@ -72,7 +72,7 @@ int main(int argc, char **argv)
     printf("[ping_server] connected to mipd via %s\n", socket_path);
     printf("[ping_server] waiting for messages...\n");
 
-    while (1) {
+    while (1) { //enter loop and listen for ping 
         char buffer[256];
         ssize_t received;
         char response[256];
@@ -89,7 +89,7 @@ int main(int argc, char **argv)
         }
 
         buffer[received] = '\0';
-
+        //if something was received, get its adress and return a PONG
         if (received > 1) {
             uint8_t source_mip_address = (uint8_t)buffer[0];
             char *payload = buffer + 1;

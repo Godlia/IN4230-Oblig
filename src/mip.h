@@ -8,59 +8,32 @@
 #define MIP_MAX_HOSTS 255u
 #define MIP_MAX_ARP_CACHE 16u
 
-/*
- * SDU types carried in a MIP PDU. This lets the receiving mipd tell an
- * ARP request/response apart from an ordinary upper-layer message
- * (e.g. a ping), which the original skeleton did not distinguish
- * (sdu_type was hardcoded to 1 for everything).
- */
 #define MIP_SDU_TYPE_ARP  0x01u
 #define MIP_SDU_TYPE_PING 0x02u
 
-/* MIP-ARP message sub-types, carried as the SDU payload when
- * sdu_type == MIP_SDU_TYPE_ARP. */
 #define MIP_ARP_REQUEST  0x00u
 #define MIP_ARP_RESPONSE 0x01u
 
-/*
- * MIP-ARP request/response payload.
- *
- * type:        MIP_ARP_REQUEST ("who has this MIP address?") or
- *              MIP_ARP_RESPONSE ("this MIP address is mine").
- * mip_address: the MIP address being queried (request) or announced
- *              (response).
- */
+/* MIP-ARP: 1 bit type + 8 bit address + 23 bit zeroes = 32 bits (4 bytes) */
 typedef struct {
-    uint8_t type;
+    uint8_t type;         /* 0x00 (Request) eller 0x01 (Response) */
     uint8_t mip_address;
-} mip_arp_message_t;
+    uint8_t reserved[3];  /* 23 bits utfylling med nuller */
+} __attribute__((packed)) mip_arp_message_t;
 
-/*
- * Minimal placeholder for the MIP header fields.
- *
- * The real assignment specifies destination/source MIP addresses, TTL,
- * SDU length, and SDU type. This simplified representation is enough for
- * structuring the implementation and for a beginner-friendly skeleton.
- */
+/* MIP Header: Dest (8b), Src (8b), TTL (4b), SDU Len (9b), SDU Type (3b) = 32 bits (4 bytes) */
 typedef struct {
-    uint8_t destination;   /* MIP address of the target host. */
-    uint8_t source;        /* MIP address of the sender host. */
-    uint8_t ttl;           /* Hop limit; decremented by routers if used later. */
-    uint16_t sdu_length;   /* Length of the payload in bytes. */
-    uint8_t sdu_type;      /* The kind of SDU being carried. */
-} mip_header_t;
+    uint8_t destination;
+    uint8_t source;
+    uint8_t ttl_and_len_hi; /* [TTL: 4 bits] [SDU Len high: 4 bits] */
+    uint8_t len_lo_and_type; /* [SDU Len low: 5 bits] [SDU Type: 3 bits] */
+} __attribute__((packed)) mip_header_t;
 
-/*
- * MIP-ARP cache entry.
- *
- * In a real implementation, this would also store the Ethernet MAC address
- * of the peer and a validity/TTL marker.
- */
 typedef struct {
     uint8_t mip_address;
     uint8_t mac_address[6];
-    int ifindex;             /* Interface index associated with this peer */
+    int ifindex;
     int valid;
 } mip_arp_entry_t;
 
-#endif /* MIP_H */
+#endif

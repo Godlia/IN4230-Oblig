@@ -18,6 +18,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+// Globals
 static mip_arp_entry_t arp_cache[MIP_MAX_ARP_CACHE];
 static int lower_socket_fd = -1;
 static unsigned int local_mip_address = 0;
@@ -28,6 +29,10 @@ static int upper_client_fd = -1;
 
 static const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+/*
+Return the name of the interface / adapter
+
+*/ 
 static int find_mip_interface_name(char *out, size_t out_len)
 {
     static const char *const candidates[] = {
@@ -52,7 +57,12 @@ static int find_mip_interface_name(char *out, size_t out_len)
     return -1;
 }
 
-/* Look up the hardware (MAC) address of a named interface via ioctl. */
+/* 
+Look up the hardware (MAC) address of a named interface
+
+*ifname - name of interface (eth0, wlan1)
+mac_out[6] - mac_adress of interface / adapter
+*/
 static int get_interface_mac(const char *ifname, uint8_t mac_out[6])
 {
     struct ifreq ifr;
@@ -78,6 +88,9 @@ static int get_interface_mac(const char *ifname, uint8_t mac_out[6])
     return 0;
 }
 
+/*
+Initializes the ARP cache
+*/
 static void init_arp_cache(void)
 {
     for (unsigned int i = 0; i < MIP_MAX_ARP_CACHE; ++i)
@@ -88,9 +101,20 @@ static void init_arp_cache(void)
     }
 }
 
+// trust me gcc, they exist
 static void learn_arp_mapping(uint8_t mip_address, const uint8_t *mac_address, int ifindex);
 static int lookup_arp_mapping(uint8_t mip_address, uint8_t mac_out[6], int *ifindex_out);
 
+/*
+Create complete frame for sendto
+ifindex - interface index
+destination_mip_address - target MIP adress
+source_mip_address - source adress
+destination_mac[6] - target MIP mac
+sdu_type - service data unit type
+*payload - pointer to data to be sent
+payload_length 
+*/
 static int send_mip_frame(int ifindex,
                           uint8_t destination_mip_address,
                           uint8_t source_mip_address,
@@ -99,7 +123,7 @@ static int send_mip_frame(int ifindex,
                           const void *payload,
                           size_t payload_length)
 {
-    uint8_t frame[sizeof(struct ether_header) + sizeof(mip_header_t) + 256u];
+    uint8_t frame[2048];
     struct ether_header *eth_header = (struct ether_header *)frame;
     mip_header_t *header = (mip_header_t *)(frame + sizeof(struct ether_header));
     struct sockaddr_ll addr;
@@ -107,7 +131,6 @@ static int send_mip_frame(int ifindex,
     if (lower_socket_fd < 0 || ifindex <= 0)
         return -1;
 
-    // Retrieve local MAC for the given sending interface
     struct ifreq ifr;
     if_indextoname(ifindex, ifr.ifr_name);
     get_interface_mac(ifr.ifr_name, local_mac_address);
@@ -117,12 +140,20 @@ static int send_mip_frame(int ifindex,
     memcpy(eth_header->ether_shost, local_mac_address, 6);
     eth_header->ether_type = htons(ETH_P_MIP);
 
+    /* 1. Beregn SDU-lengde i 32-bits ord (avrundet opp til nærmeste multiplum av 4) */
+    uint16_t sdu_words = (payload_length + 3) / 4;
+    size_t padded_payload_len = sdu_words * 4;
+
+    /* 2. Sett TTL: 1 for broadcast, anners 64 */
+    uint8_t ttl = (destination_mip_address == MIP_ADDR_BROADCAST) ? 1 : 64;
+
+    /* 3. Pakk bit-feltene inn i MIP-headeren */
     header->destination = destination_mip_address;
     header->source = source_mip_address;
-    header->ttl = 64u;
-    header->sdu_length = (uint16_t)payload_length;
-    header->sdu_type = sdu_type;
-    if (payload_length > 0u)
+    header->ttl_and_len_hi = (ttl << 4) | ((sdu_words >> 5) & 0x0F);
+    header->len_lo_and_type = ((sdu_words & 0x1F) << 3) | (sdu_type & 0x07);
+
+    if (payload_length > 0 && payload != NULL)
     {
         memcpy(frame + sizeof(struct ether_header) + sizeof(mip_header_t), payload, payload_length);
     }
@@ -135,12 +166,13 @@ static int send_mip_frame(int ifindex,
     memcpy(addr.sll_addr, destination_mac, 6);
 
     return sendto(lower_socket_fd, frame,
-                  sizeof(struct ether_header) + sizeof(mip_header_t) + payload_length,
+                  sizeof(struct ether_header) + sizeof(mip_header_t) + padded_payload_len,
                   0, (struct sockaddr *)&addr, sizeof(addr));
 }
 
 static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length, int ifindex);
 
+// get the mip adress either from cache or by broadcasting
 static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[6], int timeout_ms)
 {
     mip_arp_message_t request;
@@ -162,6 +194,7 @@ static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[
         return -1;
     }
 
+    // enter loop for response to MIP-ARP
     gettimeofday(&start, NULL);
     for (;;)
     {
@@ -201,6 +234,7 @@ static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[
         struct sockaddr_ll src_addr;
         socklen_t addr_len = sizeof(src_addr);
 
+        // who's this?
         ssize_t received = recvfrom(lower_socket_fd, raw_frame, sizeof(raw_frame), 0,
                                     (struct sockaddr *)&src_addr, &addr_len);
 
@@ -219,6 +253,7 @@ static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[
     }
 }
 
+// get details for message from the application layer
 static void handle_upper_layer_message(uint8_t source_mip_address,
                                        uint8_t destination_mip_address,
                                        const char *payload,
@@ -246,7 +281,7 @@ static void handle_upper_layer_message(uint8_t source_mip_address,
     }
 }
 
-/* Reply to a MIP-ARP request that is asking about our own address. */
+// Reply to a MIP-ARP request that is asking about our own address.
 static void handle_arp_request(uint8_t requester_mip, const uint8_t requester_mac[6], int incoming_ifindex)
 {
     mip_arp_message_t response;
@@ -259,46 +294,33 @@ static void handle_arp_request(uint8_t requester_mip, const uint8_t requester_ma
                    MIP_SDU_TYPE_ARP, &response, sizeof(response));
 }
 
+// figure out what the packet is for and respond accordingly (if needed)
 static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length, int ifindex)
 {
     if (frame == NULL || frame_length < sizeof(struct ether_header) + sizeof(mip_header_t))
-    {
-        printf("[mipd] invalid MIP packet: frame is NULL or too short\n");
         return;
-    }
 
     const struct ether_header *eth_header = (const struct ether_header *)frame;
     const mip_header_t *header = (const mip_header_t *)(frame + sizeof(struct ether_header));
+
+    /* Dekod bitfeltene */
+    uint8_t ttl = (header->ttl_and_len_hi >> 4) & 0x0F;
+    uint16_t sdu_words = ((header->ttl_and_len_hi & 0x0F) << 5) | ((header->len_lo_and_type >> 3) & 0x1F);
+    uint8_t sdu_type = header->len_lo_and_type & 0x07;
+    size_t payload_length = sdu_words * 4; /* Konverter tilbake til bytes */
+
     const uint8_t *payload = frame + sizeof(struct ether_header) + sizeof(mip_header_t);
-    size_t payload_length = frame_length - sizeof(struct ether_header) - sizeof(mip_header_t);
 
-    if (payload_length < header->sdu_length)
-    {
-        printf("[mipd] truncated MIP packet\n");
-        return;
-    }
-    payload_length = header->sdu_length;
-
-    printf("[mipd] incoming: dst_mip=%u src_mip=%u ttl=%u sdu_type=%u sdu_length=%u "
-           "from MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
-           header->destination, header->source, header->ttl, header->sdu_type,
-           header->sdu_length,
-           eth_header->ether_shost[0], eth_header->ether_shost[1], eth_header->ether_shost[2],
-           eth_header->ether_shost[3], eth_header->ether_shost[4], eth_header->ether_shost[5]);
-
-    /* Learn/refresh the sender's mapping from any frame we see, ARP or not. */
     if (header->source != 0 && header->source != MIP_ADDR_BROADCAST)
     {
         learn_arp_mapping(header->source, eth_header->ether_shost, ifindex);
     }
 
-    if (header->sdu_type == MIP_SDU_TYPE_ARP)
+    if (sdu_type == MIP_SDU_TYPE_ARP)
     {
         if (payload_length < sizeof(mip_arp_message_t))
-        {
-            printf("[mipd] malformed MIP-ARP message\n");
             return;
-        }
+
         mip_arp_message_t msg;
         memcpy(&msg, payload, sizeof(msg));
 
@@ -309,29 +331,22 @@ static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length
         return;
     }
 
-    if (header->sdu_type == MIP_SDU_TYPE_PING &&
+    if (sdu_type == MIP_SDU_TYPE_PING &&
         (header->destination == local_mip_address || header->destination == MIP_ADDR_BROADCAST))
     {
-        printf("[mipd] packet addressed to local host, delivering to upper layer\n");
-
         if (upper_client_fd < 0)
-        {
-            printf("[mipd] no upper-layer application connected; dropping\n");
             return;
-        }
 
         char up_message[257];
         up_message[0] = (char)header->source;
         size_t copy_len = payload_length < sizeof(up_message) - 1 ? payload_length : sizeof(up_message) - 1;
         memcpy(up_message + 1, payload, copy_len);
 
-        if (send(upper_client_fd, up_message, copy_len + 1, 0) < 0)
-        {
-            perror("send (to upper layer)");
-        }
+        send(upper_client_fd, up_message, copy_len + 1, 0);
     }
 }
 
+// put arp response into cache
 static void learn_arp_mapping(uint8_t mip_address, const uint8_t *mac_address, int ifindex)
 {
     if (mac_address == NULL)
@@ -360,6 +375,7 @@ static void learn_arp_mapping(uint8_t mip_address, const uint8_t *mac_address, i
     }
 }
 
+// check cache for signs of life (do we already know of this adress)
 static int lookup_arp_mapping(uint8_t mip_address, uint8_t mac_out[6], int *ifindex_out)
 {
     for (unsigned int i = 0; i < MIP_MAX_ARP_CACHE; ++i)
@@ -401,6 +417,7 @@ static void print_debug_state(void)
     }
 }
 
+// creates a socket on path given and returns its filedescriptor for the applications
 static int create_unix_socket(const char *socket_path)
 {
     int fd;
@@ -410,6 +427,7 @@ static int create_unix_socket(const char *socket_path)
         return -1;
     }
 
+    // everything is a file
     unlink(socket_path);
 
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -440,6 +458,7 @@ static int create_unix_socket(const char *socket_path)
     return fd;
 }
 
+// socket for actually sending via mip.
 static int create_raw_mip_socket(void)
 {
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_MIP));
@@ -472,6 +491,7 @@ int main(int argc, char **argv)
     int debug_mode = 0;
     char ifname[IF_NAMESIZE];
 
+    // lets make sure the user did what they should
     if (argc < 2)
     {
         print_mipd_usage();
@@ -510,6 +530,8 @@ int main(int argc, char **argv)
         print_mipd_usage();
         return 1;
     }
+
+    // good to go - start process
 
     init_arp_cache();
     local_mip_address = mip_address;
@@ -551,14 +573,14 @@ int main(int argc, char **argv)
     printf("[mipd] listening on upper-layer socket\n");
     printf("[mipd] listening on raw MIP socket\n");
 
-    while (1)
+    while (1) // event loop
     {
         fd_set read_fds;
         int max_fd;
         struct timeval timeout;
 
-        FD_ZERO(&read_fds);
-        FD_SET(upper_socket, &read_fds);
+        FD_ZERO(&read_fds);              // clear the set
+        FD_SET(upper_socket, &read_fds); // set the set to what is in the sockets
         FD_SET(lower_socket, &read_fds);
         max_fd = upper_socket > lower_socket ? upper_socket : lower_socket;
         if (upper_client_fd >= 0)
@@ -583,6 +605,7 @@ int main(int argc, char **argv)
             break;
         }
 
+        // check if something is in the lower socket
         if (FD_ISSET(lower_socket, &read_fds))
         {
             uint8_t raw_frame[2048];
@@ -598,7 +621,7 @@ int main(int argc, char **argv)
                 }
             }
         }
-
+        // same but for the upper socket
         if (upper_client_fd >= 0 && FD_ISSET(upper_client_fd, &read_fds))
         {
             char buffer[256];
@@ -615,6 +638,7 @@ int main(int argc, char **argv)
             }
             else
             {
+                // deconstruct
                 buffer[received] = '\0';
                 uint8_t destination_mip_address = (uint8_t)buffer[0];
                 uint8_t source_mip_address = (uint8_t)mip_address;
@@ -632,7 +656,7 @@ int main(int argc, char **argv)
                 }
             }
         }
-
+        // log and tell
         if (FD_ISSET(upper_socket, &read_fds))
         {
             int client_fd = accept(upper_socket, NULL, NULL);
@@ -655,6 +679,7 @@ int main(int argc, char **argv)
         }
     }
 
+    // fin
     if (upper_client_fd >= 0)
     {
         close(upper_client_fd);
