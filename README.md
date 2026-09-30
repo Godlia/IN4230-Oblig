@@ -13,6 +13,7 @@ This means that there could be an argument for smaller networks to implement MIP
 IPv4 also doesnt use ARP in the same way as MIP in this case. MIP integrates the ARP mechanism into itself, while IPv4 uses the literal ARProtocol, and is not necessarily connected to every IP transmission. This raises a few questions about the "ethics" of MIP, as we want to keep the network dumb and only process what is needed. In this case, the router / node always checks the message to see if it is an ARP request - which also implies it can read information that it is not privvy to.
 
 ### Flowchart
+
 ```
                      +---------------------------+
                      |         START             |
@@ -96,6 +97,6 @@ IPv4 also doesnt use ARP in the same way as MIP in this case. MIP integrates the
 
 AI has been utilized a substantial amount in the coding process (whether I'd liked to or not (thanks Google search)). Seeing as I come from another university where C was not really taught.
 Learning C and sockets at the same time was quite a challenge, so i have used AI for a lot of skeleton-code and function definition.
-I am genuinely interested in learning C so I was always trying to implement first, and understand after. I prefer learning by jumping into the deep end and working the pieces out bit by bit, and is how I did most of the assignment. (They are also quite dumb and get incredible scope-creep).
+I am genuinely interested in learning C so I was always trying to implement first, and understand after. I prefer learning by jumping into the deep end and working the pieces out bit by bit, and is how I did most of the assignment. (They are also quite dumb and get incredible scope-creep). LLM's are incredibly good at words, but not logic. So I have used them it for comments and checking code semantics. 
 
-All my words here are my own - as I do not use AI for writing. Potential mishaps in the implementation are my fault.
+All my words here are my own - as I do not use AI for writing. Potential mishaps in the implementation are my responsibilty.

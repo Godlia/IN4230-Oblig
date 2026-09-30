@@ -29,10 +29,20 @@ static int upper_client_fd = -1;
 
 static const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-/*
-Return the name of the interface / adapter
+// Forward declarations
+static void learn_arp_mapping(uint8_t mip_address, const uint8_t *mac_address, int ifindex);
+static int lookup_arp_mapping(uint8_t mip_address, uint8_t mac_out[6], int *ifindex_out);
+static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length, int ifindex);
 
-*/ 
+/**
+ * Return the name of the first available network interface/adapter
+ * out: pointer to buffer where the interface name will be stored.
+ * out_len: capacity of the output buffer.
+ *
+ * Scans candidate interfaces (eth0, h1-eth0, lo, etc.) and picks the first active one[cite: 16].
+ *
+ * Returns 0 on success, or -1 if no suitable network interface is found[cite: 16].
+ */
 static int find_mip_interface_name(char *out, size_t out_len)
 {
     static const char *const candidates[] = {
@@ -57,12 +67,15 @@ static int find_mip_interface_name(char *out, size_t out_len)
     return -1;
 }
 
-/* 
-Look up the hardware (MAC) address of a named interface
-
-*ifname - name of interface (eth0, wlan1)
-mac_out[6] - mac_adress of interface / adapter
-*/
+/**
+ * Look up the hardware (MAC) address of a named network interface
+ * ifname: pointer to string containing the interface name (e.g., "eth0")[cite: 16].
+ * mac_out: pointer to 6-byte output buffer where MAC address will be written[cite: 16].
+ *
+ * Uses SIOCGIFHWADDR ioctl call over a temporary socket to fetch MAC address[cite: 16].
+ *
+ * Returns 0 on success, or -1 on socket/ioctl failure[cite: 16].
+ */
 static int get_interface_mac(const char *ifname, uint8_t mac_out[6])
 {
     struct ifreq ifr;
@@ -88,9 +101,16 @@ static int get_interface_mac(const char *ifname, uint8_t mac_out[6])
     return 0;
 }
 
-/*
-Initializes the ARP cache
-*/
+/**
+ * Initialize the global ARP cache
+ *
+ * Clears all entries in the global arp_cache array and marks them invalid[cite: 16].
+ *
+ * Affects global variables:
+ * - arp_cache: writes zero/invalid state across all slots[cite: 16].
+ *
+ * Returns void.
+ */
 static void init_arp_cache(void)
 {
     for (unsigned int i = 0; i < MIP_MAX_ARP_CACHE; ++i)
@@ -101,20 +121,25 @@ static void init_arp_cache(void)
     }
 }
 
-// trust me gcc, they exist
-static void learn_arp_mapping(uint8_t mip_address, const uint8_t *mac_address, int ifindex);
-static int lookup_arp_mapping(uint8_t mip_address, uint8_t mac_out[6], int *ifindex_out);
-
-/*
-Create complete frame for sendto
-ifindex - interface index
-destination_mip_address - target MIP adress
-source_mip_address - source adress
-destination_mac[6] - target MIP mac
-sdu_type - service data unit type
-*payload - pointer to data to be sent
-payload_length 
-*/
+/**
+ * Create and transmit a complete MIP frame over the raw socket
+ * ifindex: interface index to transmit the frame over[cite: 16].
+ * destination_mip_address: target host MIP address[cite: 16].
+ * source_mip_address: local host MIP address[cite: 16].
+ * destination_mac: 6-byte destination hardware address[cite: 16].
+ * sdu_type: service data unit type (e.g., ARP=1, Ping=2)[cite: 16].
+ * payload: pointer to data buffer to transmit[cite: 16].
+ * payload_length: byte length of payload data[cite: 16].
+ *
+ * Constructs Ethernet and MIP headers, pads SDU to 32-bit word alignment,
+ * sets TTL (1 for broadcast, 64 for unicast), and transmits via sendto()[cite: 16].
+ *
+ * Affects global variables:
+ * - lower_socket_fd: read to transmit frame via raw socket[cite: 16].
+ * - local_mac_address: updated with refreshed local MAC address[cite: 16].
+ *
+ * Returns number of bytes sent on success, or -1 on error[cite: 16].
+ */
 static int send_mip_frame(int ifindex,
                           uint8_t destination_mip_address,
                           uint8_t source_mip_address,
@@ -140,14 +165,14 @@ static int send_mip_frame(int ifindex,
     memcpy(eth_header->ether_shost, local_mac_address, 6);
     eth_header->ether_type = htons(ETH_P_MIP);
 
-    /* 1. Beregn SDU-lengde i 32-bits ord (avrundet opp til nærmeste multiplum av 4) */
+    /* 1. Calculate SDU length in 32-bit words (rounded up) */
     uint16_t sdu_words = (payload_length + 3) / 4;
     size_t padded_payload_len = sdu_words * 4;
 
-    /* 2. Sett TTL: 1 for broadcast, anners 64 */
+    /* 2. Set TTL: 1 for broadcast, 64 for unicast */
     uint8_t ttl = (destination_mip_address == MIP_ADDR_BROADCAST) ? 1 : 64;
 
-    /* 3. Pakk bit-feltene inn i MIP-headeren */
+    /* 3. Pack bitfields into MIP header struct */
     header->destination = destination_mip_address;
     header->source = source_mip_address;
     header->ttl_and_len_hi = (ttl << 4) | ((sdu_words >> 5) & 0x0F);
@@ -170,9 +195,22 @@ static int send_mip_frame(int ifindex,
                   0, (struct sockaddr *)&addr, sizeof(addr));
 }
 
-static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length, int ifindex);
-
-// get the mip adress either from cache or by broadcasting
+/**
+ * Resolve target MIP address to MAC address via ARP cache or network broadcast
+ * destination_mip_address: target host MIP address to resolve[cite: 16].
+ * mac_out: 6-byte buffer where resolved MAC address is stored[cite: 16].
+ * timeout_ms: timeout duration in milliseconds to wait for ARP reply[cite: 16].
+ *
+ * Checks local cache first; if missing, broadcasts MIP-ARP request and enters
+ * a select() event loop to await matching ARP response before timeout[cite: 16].
+ *
+ * Affects global variables:
+ * - arp_cache: read during lookup, updated via incoming ARP response[cite: 16].
+ * - lower_socket_fd: read/write to broadcast ARP and receive responses[cite: 16].
+ * - mip_ifindex, local_mip_address, broadcast_mac: read to send ARP request[cite: 16].
+ *
+ * Returns 0 on successful resolution, or -1 on error/timeout[cite: 16].
+ */
 static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[6], int timeout_ms)
 {
     mip_arp_message_t request;
@@ -184,6 +222,7 @@ static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[
         return 0;
     }
 
+    memset(&request, 0, sizeof(request));
     request.type = MIP_ARP_REQUEST;
     request.mip_address = destination_mip_address;
 
@@ -194,7 +233,6 @@ static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[
         return -1;
     }
 
-    // enter loop for response to MIP-ARP
     gettimeofday(&start, NULL);
     for (;;)
     {
@@ -234,7 +272,6 @@ static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[
         struct sockaddr_ll src_addr;
         socklen_t addr_len = sizeof(src_addr);
 
-        // who's this?
         ssize_t received = recvfrom(lower_socket_fd, raw_frame, sizeof(raw_frame), 0,
                                     (struct sockaddr *)&src_addr, &addr_len);
 
@@ -253,7 +290,21 @@ static int resolve_mip_address(uint8_t destination_mip_address, uint8_t mac_out[
     }
 }
 
-// get details for message from the application layer
+/**
+ * Handle data received from the upper-layer application
+ * source_mip_address: source host MIP address[cite: 16].
+ * destination_mip_address: destination host MIP address[cite: 16].
+ * payload: pointer to application payload string/data[cite: 16].
+ * payload_length: byte size of application payload[cite: 16].
+ *
+ * Resolves destination MAC address via MIP-ARP and transmits payload as a Ping frame[cite: 16].
+ * Drops packet if address resolution fails[cite: 16].
+ *
+ * Affects global variables:
+ * - Indirectly uses arp_cache, lower_socket_fd, mip_ifindex, local_mip_address[cite: 16].
+ *
+ * Returns void.
+ */
 static void handle_upper_layer_message(uint8_t source_mip_address,
                                        uint8_t destination_mip_address,
                                        const char *payload,
@@ -281,10 +332,24 @@ static void handle_upper_layer_message(uint8_t source_mip_address,
     }
 }
 
-// Reply to a MIP-ARP request that is asking about our own address.
+/**
+ * Reply to an incoming MIP-ARP request querying local host's address
+ * requester_mip: MIP address of requesting host[cite: 16].
+ * requester_mac: 6-byte MAC address of requesting host[cite: 16].
+ * incoming_ifindex: interface index where request was received[cite: 16].
+ *
+ * Constructs and transmits a unicast MIP-ARP Response containing local MIP address[cite: 16].
+ *
+ * Affects global variables:
+ * - local_mip_address: read as response payload[cite: 16].
+ * - lower_socket_fd: read via send_mip_frame[cite: 16].
+ *
+ * Returns void.
+ */
 static void handle_arp_request(uint8_t requester_mip, const uint8_t requester_mac[6], int incoming_ifindex)
 {
     mip_arp_message_t response;
+    memset(&response, 0, sizeof(response));
 
     response.type = MIP_ARP_RESPONSE;
     response.mip_address = (uint8_t)local_mip_address;
@@ -294,7 +359,22 @@ static void handle_arp_request(uint8_t requester_mip, const uint8_t requester_ma
                    MIP_SDU_TYPE_ARP, &response, sizeof(response));
 }
 
-// figure out what the packet is for and respond accordingly (if needed)
+/**
+ * Parse and route incoming MIP packet frame
+ * frame: pointer to raw received network packet frame[cite: 16].
+ * frame_length: total byte size of received frame[cite: 16].
+ * ifindex: interface index where packet arrived[cite: 16].
+ *
+ * Auto-learns source ARP mapping, processes ARP requests/responses, and passes
+ * Ping SDU messages to upper-layer application socket[cite: 16].
+ *
+ * Affects global variables:
+ * - arp_cache: modified via learn_arp_mapping[cite: 16].
+ * - local_mip_address: read to check packet destination[cite: 16].
+ * - upper_client_fd: read/used to forward message to client application[cite: 16].
+ *
+ * Returns void.
+ */
 static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length, int ifindex)
 {
     if (frame == NULL || frame_length < sizeof(struct ether_header) + sizeof(mip_header_t))
@@ -303,11 +383,10 @@ static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length
     const struct ether_header *eth_header = (const struct ether_header *)frame;
     const mip_header_t *header = (const mip_header_t *)(frame + sizeof(struct ether_header));
 
-    /* Dekod bitfeltene */
-    uint8_t ttl = (header->ttl_and_len_hi >> 4) & 0x0F;
+    /* Unpack bitfields */
     uint16_t sdu_words = ((header->ttl_and_len_hi & 0x0F) << 5) | ((header->len_lo_and_type >> 3) & 0x1F);
     uint8_t sdu_type = header->len_lo_and_type & 0x07;
-    size_t payload_length = sdu_words * 4; /* Konverter tilbake til bytes */
+    size_t payload_length = sdu_words * 4;
 
     const uint8_t *payload = frame + sizeof(struct ether_header) + sizeof(mip_header_t);
 
@@ -346,7 +425,20 @@ static void handle_incoming_mip_packet(const uint8_t *frame, size_t frame_length
     }
 }
 
-// put arp response into cache
+/**
+ * Cache or update a MIP-to-MAC address mapping entry
+ * mip_address: MIP address to store[cite: 16].
+ * mac_address: pointer to 6-byte MAC address[cite: 16].
+ * ifindex: interface index associated with mapping[cite: 16].
+ *
+ * Updates existing matching entry if present, or writes to first empty entry[cite: 16].
+ * Silently ignores request if cache is full or mac_address is NULL[cite: 16].
+ *
+ * Affects global variables:
+ * - arp_cache: written/updated with new entry[cite: 16].
+ *
+ * Returns void.
+ */
 static void learn_arp_mapping(uint8_t mip_address, const uint8_t *mac_address, int ifindex)
 {
     if (mac_address == NULL)
@@ -375,7 +467,19 @@ static void learn_arp_mapping(uint8_t mip_address, const uint8_t *mac_address, i
     }
 }
 
-// check cache for signs of life (do we already know of this adress)
+/**
+ * Look up MAC address for a given MIP address in local cache
+ * mip_address: MIP address to search for[cite: 16].
+ * mac_out: pointer to 6-byte buffer where matched MAC address is copied[cite: 16].
+ * ifindex_out: optional output pointer to store matching interface index[cite: 16].
+ *
+ * Searches valid entries in local arp_cache table[cite: 16].
+ *
+ * Affects global variables:
+ * - arp_cache: read to check valid cached mappings[cite: 16].
+ *
+ * Returns 0 on success (hit), or -1 if entry is not found (miss)[cite: 16].
+ */
 static int lookup_arp_mapping(uint8_t mip_address, uint8_t mac_out[6], int *ifindex_out)
 {
     for (unsigned int i = 0; i < MIP_MAX_ARP_CACHE; ++i)
@@ -391,6 +495,16 @@ static int lookup_arp_mapping(uint8_t mip_address, uint8_t mac_out[6], int *ifin
     return -1;
 }
 
+/**
+ * Print debug information showing current state of ARP cache table
+ *
+ * Outputs index, MIP address, MAC address, and interface index for valid entries[cite: 16].
+ *
+ * Affects global variables:
+ * - arp_cache: read to print current cache contents[cite: 16].
+ *
+ * Returns void.
+ */
 static void print_debug_state(void)
 {
     printf("[mipd] ARP cache:\n");
@@ -417,7 +531,14 @@ static void print_debug_state(void)
     }
 }
 
-// creates a socket on path given and returns its filedescriptor for the applications
+/**
+ * Create, bind, and set up a Unix domain IPC socket
+ * socket_path: filesystem path for Unix socket file[cite: 16].
+ *
+ * Unlinks old path if present, creates AF_UNIX streaming socket, binds, and listens[cite: 16].
+ *
+ * Returns valid file descriptor on success, or -1 on error[cite: 16].
+ */
 static int create_unix_socket(const char *socket_path)
 {
     int fd;
@@ -427,7 +548,6 @@ static int create_unix_socket(const char *socket_path)
         return -1;
     }
 
-    // everything is a file
     unlink(socket_path);
 
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -458,7 +578,13 @@ static int create_unix_socket(const char *socket_path)
     return fd;
 }
 
-// socket for actually sending via mip.
+/**
+ * Create and bind raw MIP packet socket
+ *
+ * Creates AF_PACKET raw socket bound to ETH_P_MIP protocol across all interfaces[cite: 16].
+ *
+ * Returns valid raw socket file descriptor on success, or -1 on error[cite: 16].
+ */
 static int create_raw_mip_socket(void)
 {
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_MIP));
@@ -472,7 +598,7 @@ static int create_raw_mip_socket(void)
     memset(&addr, 0, sizeof(addr));
     addr.sll_family = AF_PACKET;
     addr.sll_protocol = htons(ETH_P_MIP);
-    addr.sll_ifindex = 0; /* 0 means bind to ALL interfaces */
+    addr.sll_ifindex = 0;
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
@@ -484,6 +610,20 @@ static int create_raw_mip_socket(void)
     return fd;
 }
 
+/**
+ * Program main entry point and non-blocking I/O event loop
+ * argc: command line argument count[cite: 16].
+ * argv: command line argument string array[cite: 16].
+ *
+ * Parses arguments (-d, socket path, MIP address), initializes state/sockets,
+ * and runs main select() loop to process incoming network and application I/O[cite: 16].
+ *
+ * Affects global variables:
+ * - local_mip_address, mip_ifindex, local_mac_address, lower_socket_fd, upper_client_fd[cite: 16].
+ * - arp_cache: initialized at startup[cite: 16].
+ *
+ * Returns 0 on clean exit, or 1 on argument/initialization failure[cite: 16].
+ */
 int main(int argc, char **argv)
 {
     const char *socket_path = NULL;
@@ -491,7 +631,6 @@ int main(int argc, char **argv)
     int debug_mode = 0;
     char ifname[IF_NAMESIZE];
 
-    // lets make sure the user did what they should
     if (argc < 2)
     {
         print_mipd_usage();
@@ -530,8 +669,6 @@ int main(int argc, char **argv)
         print_mipd_usage();
         return 1;
     }
-
-    // good to go - start process
 
     init_arp_cache();
     local_mip_address = mip_address;
@@ -573,14 +710,14 @@ int main(int argc, char **argv)
     printf("[mipd] listening on upper-layer socket\n");
     printf("[mipd] listening on raw MIP socket\n");
 
-    while (1) // event loop
+    while (1)
     {
         fd_set read_fds;
         int max_fd;
         struct timeval timeout;
 
-        FD_ZERO(&read_fds);              // clear the set
-        FD_SET(upper_socket, &read_fds); // set the set to what is in the sockets
+        FD_ZERO(&read_fds);
+        FD_SET(upper_socket, &read_fds);
         FD_SET(lower_socket, &read_fds);
         max_fd = upper_socket > lower_socket ? upper_socket : lower_socket;
         if (upper_client_fd >= 0)
@@ -605,7 +742,6 @@ int main(int argc, char **argv)
             break;
         }
 
-        // check if something is in the lower socket
         if (FD_ISSET(lower_socket, &read_fds))
         {
             uint8_t raw_frame[2048];
@@ -621,7 +757,7 @@ int main(int argc, char **argv)
                 }
             }
         }
-        // same but for the upper socket
+
         if (upper_client_fd >= 0 && FD_ISSET(upper_client_fd, &read_fds))
         {
             char buffer[256];
@@ -638,7 +774,6 @@ int main(int argc, char **argv)
             }
             else
             {
-                // deconstruct
                 buffer[received] = '\0';
                 uint8_t destination_mip_address = (uint8_t)buffer[0];
                 uint8_t source_mip_address = (uint8_t)mip_address;
@@ -656,7 +791,7 @@ int main(int argc, char **argv)
                 }
             }
         }
-        // log and tell
+
         if (FD_ISSET(upper_socket, &read_fds))
         {
             int client_fd = accept(upper_socket, NULL, NULL);
@@ -679,7 +814,6 @@ int main(int argc, char **argv)
         }
     }
 
-    // fin
     if (upper_client_fd >= 0)
     {
         close(upper_client_fd);
